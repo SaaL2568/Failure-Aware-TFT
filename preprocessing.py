@@ -38,17 +38,17 @@ class MIMICPreprocessor:
             
             hospital_expire_flag = row.get('hospital_expire_flag', 0)
             
-            if pd.notna(row.get('deathtime')):
+            label = 0
+            
+            if hospital_expire_flag == 1:
+                label = 1
+            elif pd.notna(row.get('deathtime')):
                 death_time = row['deathtime']
                 icu_intime = row['intime']
-                time_to_death = (death_time - icu_intime).total_seconds() / 3600
+                icu_outtime = row['outtime']
                 
-                if time_to_death > Config.LOOKBACK_WINDOW and time_to_death <= Config.LOOKBACK_WINDOW + Config.PREDICTION_WINDOW:
+                if death_time >= icu_intime and death_time <= icu_outtime:
                     label = 1
-                else:
-                    label = 0
-            else:
-                label = 0
             
             labels.append({
                 'subject_id': subject_id,

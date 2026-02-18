@@ -191,10 +191,40 @@ def main():
     val_size = int(0.15 * len(dataset))
     test_size = len(dataset) - train_size - val_size
     
-    train_dataset, val_dataset, test_dataset = random_split(
-        dataset, [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(Config.SEED)
+    labels_array = np.array([s['label'] for s in sequences])
+    
+    if labels_array.sum() < 10:
+        print(f"WARNING: Only {labels_array.sum()} positive samples found!")
+        print("Consider:")
+        print("  1. Increasing SAMPLE_SIZE in config.py")
+        print("  2. Adjusting label criteria")
+        print("  3. Using different prediction task")
+    
+    from sklearn.model_selection import train_test_split
+    
+    indices = np.arange(len(dataset))
+    
+    train_val_idx, test_idx = train_test_split(
+        indices, 
+        test_size=test_size, 
+        random_state=Config.SEED,
+        stratify=labels_array if labels_array.sum() >= 2 else None
     )
+    
+    train_idx, val_idx = train_test_split(
+        train_val_idx,
+        test_size=val_size,
+        random_state=Config.SEED,
+        stratify=labels_array[train_val_idx] if labels_array[train_val_idx].sum() >= 2 else None
+    )
+    
+    train_dataset = torch.utils.data.Subset(dataset, train_idx)
+    val_dataset = torch.utils.data.Subset(dataset, val_idx)
+    test_dataset = torch.utils.data.Subset(dataset, test_idx)
+    
+    print(f"Train positive: {labels_array[train_idx].sum()}/{len(train_idx)}")
+    print(f"Val positive: {labels_array[val_idx].sum()}/{len(val_idx)}")
+    print(f"Test positive: {labels_array[test_idx].sum()}/{len(test_idx)}")
     
     train_loader = DataLoader(
         train_dataset,
