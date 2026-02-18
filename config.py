@@ -17,6 +17,8 @@ class Config:
     DATA_PATH_HOSP = "C:/Users/pranay/Projects/Deep Learning/mimic-iv-3.1/hosp/"
     DATA_PATH_ICU = "C:/Users/pranay/Projects/Deep Learning/mimic-iv-3.1/icu/"
     
+    SAMPLE_SIZE = 5000
+    
     PREDICTION_WINDOW = 6
     LOOKBACK_WINDOW = 24
     TIME_STEP_HOURS = 1

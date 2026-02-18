@@ -26,18 +26,62 @@ class MIMICDataLoader:
         icustays['outtime'] = pd.to_datetime(icustays['outtime'])
         return icustays
     
-    def load_chartevents(self, itemids=None):
-        chartevents = pd.read_csv(f"{self.icu_path}chartevents.csv")
+    def load_chartevents(self, itemids=None, stay_ids=None, chunksize=100000):
+        chunks = []
+        total_rows = 0
+        
+        print("Loading chartevents in chunks (this may take a few minutes)...")
+        
+        for i, chunk in enumerate(pd.read_csv(f"{self.icu_path}chartevents.csv", chunksize=chunksize)):
+            if itemids is not None:
+                chunk = chunk[chunk['itemid'].isin(itemids)]
+            
+            if stay_ids is not None:
+                chunk = chunk[chunk['stay_id'].isin(stay_ids)]
+            
+            if len(chunk) > 0:
+                chunks.append(chunk)
+                total_rows += len(chunk)
+            
+            if (i + 1) % 10 == 0:
+                print(f"  Processed {(i+1)*chunksize:,} rows, kept {total_rows:,} relevant rows")
+        
+        if len(chunks) == 0:
+            return pd.DataFrame()
+        
+        chartevents = pd.concat(chunks, ignore_index=True)
         chartevents['charttime'] = pd.to_datetime(chartevents['charttime'])
-        if itemids:
-            chartevents = chartevents[chartevents['itemid'].isin(itemids)]
+        
+        print(f"  Final chartevents size: {len(chartevents):,} rows")
         return chartevents
     
-    def load_labevents(self, itemids=None):
-        labevents = pd.read_csv(f"{self.hosp_path}labevents.csv")
+    def load_labevents(self, itemids=None, subject_ids=None, chunksize=100000):
+        chunks = []
+        total_rows = 0
+        
+        print("Loading labevents in chunks (this may take a few minutes)...")
+        
+        for i, chunk in enumerate(pd.read_csv(f"{self.hosp_path}labevents.csv", chunksize=chunksize)):
+            if itemids is not None:
+                chunk = chunk[chunk['itemid'].isin(itemids)]
+            
+            if subject_ids is not None:
+                chunk = chunk[chunk['subject_id'].isin(subject_ids)]
+            
+            if len(chunk) > 0:
+                chunks.append(chunk)
+                total_rows += len(chunk)
+            
+            if (i + 1) % 10 == 0:
+                print(f"  Processed {(i+1)*chunksize:,} rows, kept {total_rows:,} relevant rows")
+        
+        if len(chunks) == 0:
+            return pd.DataFrame()
+        
+        labevents = pd.concat(chunks, ignore_index=True)
         labevents['charttime'] = pd.to_datetime(labevents['charttime'])
-        if itemids:
-            labevents = labevents[labevents['itemid'].isin(itemids)]
+        
+        print(f"  Final labevents size: {len(labevents):,} rows")
         return labevents
     
     def load_inputevents(self):

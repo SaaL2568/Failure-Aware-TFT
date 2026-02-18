@@ -20,6 +20,12 @@ class MIMICPreprocessor:
         
         cohort = cohort[cohort['los'] >= Config.LOOKBACK_WINDOW / 24]
         
+        if hasattr(Config, 'SAMPLE_SIZE') and Config.SAMPLE_SIZE is not None:
+            if len(cohort) > Config.SAMPLE_SIZE:
+                print(f"Sampling {Config.SAMPLE_SIZE} from {len(cohort)} ICU stays for faster processing")
+                cohort = cohort.sample(n=Config.SAMPLE_SIZE, random_state=Config.SEED)
+                cohort = cohort.reset_index(drop=True)
+        
         return cohort
     
     def create_labels(self, cohort):
@@ -97,12 +103,28 @@ class MIMICPreprocessor:
         return static_features
     
     def extract_time_series(self, cohort):
-        chartevents = self.data_loader.load_chartevents(Config.VITAL_ITEMIDS)
-        labevents = self.data_loader.load_labevents(Config.LAB_ITEMIDS)
+        stay_ids = cohort['stay_id'].unique().tolist()
+        subject_ids = cohort['subject_id'].unique().tolist()
+        
+        print(f"Extracting time series for {len(stay_ids)} ICU stays and {len(subject_ids)} subjects...")
+        
+        chartevents = self.data_loader.load_chartevents(
+            itemids=Config.VITAL_ITEMIDS,
+            stay_ids=stay_ids
+        )
+        
+        labevents = self.data_loader.load_labevents(
+            itemids=Config.LAB_ITEMIDS,
+            subject_ids=subject_ids
+        )
         
         time_series_data = []
         
+        print(f"Processing {len(cohort)} patient records...")
         for idx, row in cohort.iterrows():
+            if (idx + 1) % 1000 == 0:
+                print(f"  Processed {idx+1}/{len(cohort)} records")
+            
             stay_id = row['stay_id']
             intime = row['intime']
             window_end = intime + timedelta(hours=Config.LOOKBACK_WINDOW)
@@ -156,6 +178,7 @@ class MIMICPreprocessor:
             
             time_series_data.append(ts_record)
         
+        print(f"Time series extraction complete!")
         return time_series_data
     
     def normalize_features(self, time_series_data, fit=True):
