@@ -4,33 +4,51 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 import numpy as np
 import os
+import joblib
 from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
+from sklearn.preprocessing import StandardScaler
+
 from config import Config, set_seed
 from data_loader import MIMICDataLoader
 from preprocessing import MIMICPreprocessor
 from model import FailureAwareTFT
 from dataset import MIMICDataset, collate_fn
+from trajectory_head import quantileLoss
 
 set_seed(Config.SEED)
 
-class UncertaintyRegularizedLoss(nn.Module):
-    def __init__(self, pos_weight, uncertainty_weight):
+
+class MultiTaskLoss(nn.Module):
+    """
+    Combined loss = BCE (classification) + uncertainty regularization + quantile loss (trajectory)
+    """
+
+    def __init__(self, pos_weight, uncertainty_weight, trajectory_weight):
         super().__init__()
-        self.bce = nn.BCELoss(reduction='none')
+        self.bce = nn.BCELoss(reduction="none")
         self.pos_weight = pos_weight
         self.uncertainty_weight = uncertainty_weight
-    
-    def forward(self, predictions, labels, uncertainty):
+        self.trajectory_weight = trajectory_weight
+        self.quantiles = Config.QUANTILES
+
+    def forward(self, predictions, labels, uncertainty, trajectories, future_vitals, future_mask=None):
         bce_loss = self.bce(predictions, labels)
-        
-        weights = torch.where(labels > 0.5, self.pos_weight, 1.0)
+        weights = torch.where(labels > 0.5,
+                              torch.tensor(self.pos_weight, device=labels.device),
+                              torch.tensor(1.0, device=labels.device))
         weighted_bce = (bce_loss * weights).mean()
-        
+
         uncertainty_reg = uncertainty.mean()
-        
-        total_loss = weighted_bce + self.uncertainty_weight * uncertainty_reg
-        
-        return total_loss, weighted_bce, uncertainty_reg
+
+        traj_loss = quantileLoss(trajectories, future_vitals, self.quantiles, mask=future_mask)
+
+        total = (
+            weighted_bce
+            + self.uncertainty_weight * uncertainty_reg
+            + self.trajectory_weight * traj_loss
+        )
+        return total, weighted_bce, uncertainty_reg, traj_loss
+
 
 class Trainer:
     def __init__(self, model, train_loader, val_loader, config):
@@ -39,222 +57,197 @@ class Trainer:
         self.val_loader = val_loader
         self.config = config
         self.device = config.DEVICE
-        
+
         self.model.to(self.device)
-        
-        self.criterion = UncertaintyRegularizedLoss(config.POS_WEIGHT, config.UNCERTAINTY_WEIGHT)
+
+        self.criterion = MultiTaskLoss(
+            pos_weight=config.POS_WEIGHT,
+            uncertainty_weight=config.UNCERTAINTY_WEIGHT,
+            trajectory_weight=config.TRAJECTORY_LOSS_WEIGHT,
+        )
         self.optimizer = optim.Adam(
             model.parameters(),
             lr=config.LEARNING_RATE,
-            weight_decay=config.WEIGHT_DECAY
+            weight_decay=config.WEIGHT_DECAY,
         )
-        
-        self.best_val_loss = float('inf')
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode="min", factor=0.5, patience=5
+        )
+
+        self.best_val_loss = float("inf")
         self.patience_counter = 0
-        
         os.makedirs(config.SAVE_PATH, exist_ok=True)
-    
-    def train_epoch(self):
+
+    def _makeDummyFutureVitals(self, batch_size, device):
+        """
+        Placeholder for future vital targets when not available in dataset.
+        Returns zeros with a mask of zeros (contributes nothing to loss).
+        """
+        future = torch.zeros(
+            batch_size, Config.TRAJECTORY_HORIZON_STEPS, Config.NUM_TARGET_VITALS, device=device
+        )
+        mask = torch.zeros_like(future)
+        return future, mask
+
+    def trainEpoch(self):
         self.model.train()
-        total_loss = 0
-        total_bce = 0
-        total_uncertainty = 0
-        
-        for batch_idx, (static, time_series, labels, masks, _) in enumerate(self.train_loader):
+        totals = {"loss": 0, "bce": 0, "uncertainty": 0, "traj": 0}
+
+        for static, time_series, labels, masks, _ in self.train_loader:
             static = static.to(self.device)
             time_series = time_series.to(self.device)
             labels = labels.to(self.device)
             masks = masks.to(self.device)
-            
+            batch_size = static.shape[0]
+
+            future_vitals, future_mask = self._makeDummyFutureVitals(batch_size, self.device)
+
             self.optimizer.zero_grad()
-            
-            predictions, uncertainty, failure_risk, _ = self.model(
+
+            predictions, uncertainty, failure_risk, trajectories, _ = self.model(
                 static, time_series, masks, training=True
             )
-            
-            loss, bce_loss, uncertainty_reg = self.criterion(predictions, labels, uncertainty)
-            
+
+            loss, bce, unc_reg, traj = self.criterion(
+                predictions, labels, uncertainty, trajectories, future_vitals, future_mask
+            )
+
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.GRAD_CLIP)
             self.optimizer.step()
-            
-            total_loss += loss.item()
-            total_bce += bce_loss.item()
-            total_uncertainty += uncertainty_reg.item()
-        
-        avg_loss = total_loss / len(self.train_loader)
-        avg_bce = total_bce / len(self.train_loader)
-        avg_uncertainty = total_uncertainty / len(self.train_loader)
-        
-        return avg_loss, avg_bce, avg_uncertainty
-    
+
+            totals["loss"] += loss.item()
+            totals["bce"] += bce.item()
+            totals["uncertainty"] += unc_reg.item()
+            totals["traj"] += traj.item()
+
+        n = len(self.train_loader)
+        return {k: v / n for k, v in totals.items()}
+
     def validate(self):
         self.model.eval()
         total_loss = 0
-        all_predictions = []
-        all_labels = []
-        all_uncertainties = []
-        all_failure_risks = []
-        
+        all_preds, all_labels, all_unc = [], [], []
+
         with torch.no_grad():
             for static, time_series, labels, masks, _ in self.val_loader:
                 static = static.to(self.device)
                 time_series = time_series.to(self.device)
                 labels = labels.to(self.device)
                 masks = masks.to(self.device)
-                
-                predictions, uncertainty, failure_risk, _ = self.model(
+                batch_size = static.shape[0]
+
+                future_vitals, future_mask = self._makeDummyFutureVitals(batch_size, self.device)
+
+                predictions, uncertainty, _, trajectories, _ = self.model(
                     static, time_series, masks, training=False
                 )
-                
-                loss, _, _ = self.criterion(predictions, labels, uncertainty)
-                
+
+                loss, _, _, _ = self.criterion(
+                    predictions, labels, uncertainty, trajectories, future_vitals, future_mask
+                )
                 total_loss += loss.item()
-                all_predictions.extend(predictions.cpu().numpy())
+                all_preds.extend(predictions.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
-                all_uncertainties.extend(uncertainty.cpu().numpy())
-                all_failure_risks.extend(failure_risk.cpu().numpy())
-        
-        avg_loss = total_loss / len(self.val_loader)
-        
-        all_predictions = np.array(all_predictions).flatten()
+                all_unc.extend(uncertainty.cpu().numpy())
+
+        all_preds = np.array(all_preds).flatten()
         all_labels = np.array(all_labels).flatten()
-        
-        auroc = roc_auc_score(all_labels, all_predictions)
-        auprc = average_precision_score(all_labels, all_predictions)
-        
-        pred_binary = (all_predictions > 0.5).astype(int)
-        f1 = f1_score(all_labels, pred_binary)
-        
-        return avg_loss, auroc, auprc, f1
-    
+        avg_loss = total_loss / len(self.val_loader)
+
+        auroc = roc_auc_score(all_labels, all_preds) if len(np.unique(all_labels)) > 1 else 0.0
+        auprc = average_precision_score(all_labels, all_preds) if len(np.unique(all_labels)) > 1 else 0.0
+        f1 = f1_score(all_labels, (all_preds > 0.5).astype(int), zero_division=0)
+
+        return avg_loss, auroc, auprc, f1, all_preds
+
     def train(self):
         print(f"Training on {self.device}")
-        print(f"Train samples: {len(self.train_loader.dataset)}")
-        print(f"Val samples: {len(self.val_loader.dataset)}")
-        
+        print(f"Train: {len(self.train_loader.dataset)} | Val: {len(self.val_loader.dataset)}")
+
+        val_scores_history = []
+
         for epoch in range(self.config.EPOCHS):
-            train_loss, train_bce, train_uncertainty = self.train_epoch()
-            val_loss, val_auroc, val_auprc, val_f1 = self.validate()
-            
+            train_metrics = self.trainEpoch()
+            val_loss, auroc, auprc, f1, val_preds = self.validate()
+
+            self.scheduler.step(val_loss)
+            val_scores_history.extend(val_preds.tolist())
+
             print(f"Epoch {epoch+1}/{self.config.EPOCHS}")
-            print(f"  Train Loss: {train_loss:.4f} (BCE: {train_bce:.4f}, Uncertainty: {train_uncertainty:.4f})")
-            print(f"  Val Loss: {val_loss:.4f}, AUROC: {val_auroc:.4f}, AUPRC: {val_auprc:.4f}, F1: {val_f1:.4f}")
-            
+            print(f"  Train — loss:{train_metrics['loss']:.4f} bce:{train_metrics['bce']:.4f} "
+                  f"unc:{train_metrics['uncertainty']:.4f} traj:{train_metrics['traj']:.4f}")
+            print(f"  Val   — loss:{val_loss:.4f} AUROC:{auroc:.4f} AUPRC:{auprc:.4f} F1:{f1:.4f}")
+
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.patience_counter = 0
                 torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'val_loss': val_loss,
-                    'val_auroc': val_auroc,
-                    'val_auprc': val_auprc,
-                    'val_f1': val_f1
+                    "epoch": epoch,
+                    "model_state_dict": self.model.state_dict(),
+                    "optimizer_state_dict": self.optimizer.state_dict(),
+                    "val_loss": val_loss,
+                    "val_auroc": auroc,
+                    "val_auprc": auprc,
+                    "val_f1": f1,
                 }, f"{self.config.SAVE_PATH}best_model.pt")
-                print(f"  Model saved!")
+                print("  Checkpoint saved.")
             else:
                 self.patience_counter += 1
                 if self.patience_counter >= self.config.EARLY_STOPPING_PATIENCE:
-                    print(f"Early stopping at epoch {epoch+1}")
+                    print(f"Early stopping at epoch {epoch+1}.")
                     break
+
+        return val_scores_history
+
 
 def main():
     data_loader = MIMICDataLoader(Config.DATA_PATH_HOSP, Config.DATA_PATH_ICU)
     preprocessor = MIMICPreprocessor(data_loader)
-    
+
     print("Creating cohort...")
     cohort = preprocessor.create_cohort()
-    print(f"Cohort size: {len(cohort)}")
-    
+    print(f"Cohort: {len(cohort)} stays")
+
     print("Creating labels...")
     labels = preprocessor.create_labels(cohort)
-    print(f"Positive samples: {labels['label'].sum()}/{len(labels)}")
-    
+    pos = labels["label"].sum()
+    print(f"Positive: {int(pos)}/{len(labels)} ({100*pos/len(labels):.2f}%)")
+
     print("Extracting static features...")
     static_features = preprocessor.extract_static_features(cohort)
-    
+
     print("Extracting time series...")
     time_series_data = preprocessor.extract_time_series(cohort)
-    
+
     print("Normalizing features...")
     time_series_data, feature_names = preprocessor.normalize_features(time_series_data, fit=True)
-    
+
+    joblib.dump(preprocessor.scalers["time_series"], f"{Config.SAVE_PATH}scaler.pkl")
+    print("Scaler saved.")
+
     print("Creating sequences...")
     sequences = preprocessor.create_sequences(time_series_data, static_features, labels)
     print(f"Total sequences: {len(sequences)}")
-    
+
     dataset = MIMICDataset(sequences)
-    
     train_size = int(0.7 * len(dataset))
-    val_size = int(0.15 * len(dataset))
-    test_size = len(dataset) - train_size - val_size
-    
-    labels_array = np.array([s['label'] for s in sequences])
-    
-    if labels_array.sum() < 10:
-        print(f"WARNING: Only {labels_array.sum()} positive samples found!")
-        print("Consider:")
-        print("  1. Increasing SAMPLE_SIZE in config.py")
-        print("  2. Adjusting label criteria")
-        print("  3. Using different prediction task")
-    
-    from sklearn.model_selection import train_test_split
-    
-    indices = np.arange(len(dataset))
-    
-    train_val_idx, test_idx = train_test_split(
-        indices, 
-        test_size=test_size, 
-        random_state=Config.SEED,
-        stratify=labels_array if labels_array.sum() >= 2 else None
+    val_size   = int(0.15 * len(dataset))
+    test_size  = len(dataset) - train_size - val_size
+
+    train_ds, val_ds, test_ds = random_split(
+        dataset, [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(Config.SEED),
     )
-    
-    train_idx, val_idx = train_test_split(
-        train_val_idx,
-        test_size=val_size,
-        random_state=Config.SEED,
-        stratify=labels_array[train_val_idx] if labels_array[train_val_idx].sum() >= 2 else None
-    )
-    
-    train_dataset = torch.utils.data.Subset(dataset, train_idx)
-    val_dataset = torch.utils.data.Subset(dataset, val_idx)
-    test_dataset = torch.utils.data.Subset(dataset, test_idx)
-    
-    print(f"Train positive: {labels_array[train_idx].sum()}/{len(train_idx)}")
-    print(f"Val positive: {labels_array[val_idx].sum()}/{len(val_idx)}")
-    print(f"Test positive: {labels_array[test_idx].sum()}/{len(test_idx)}")
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=Config.BATCH_SIZE,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=0
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=Config.BATCH_SIZE,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=0
-    )
-    
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=Config.BATCH_SIZE,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=0
-    )
-    
-    static_size = sequences[0]['static'].shape[0]
-    time_series_size = sequences[0]['time_series'].shape[1]
-    
-    print(f"Static size: {static_size}, Time series size: {time_series_size}")
-    
+
+    train_loader = DataLoader(train_ds, batch_size=Config.BATCH_SIZE, shuffle=True,  collate_fn=collate_fn)
+    val_loader   = DataLoader(val_ds,   batch_size=Config.BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+    test_loader  = DataLoader(test_ds,  batch_size=Config.BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+
+    static_size      = sequences[0]["static"].shape[0]
+    time_series_size = sequences[0]["time_series"].shape[1]
+    print(f"Static size: {static_size} | TS size: {time_series_size}")
+
     model = FailureAwareTFT(
         static_size=static_size,
         time_series_size=time_series_size,
@@ -262,18 +255,25 @@ def main():
         num_heads=Config.NUM_HEADS,
         dropout=Config.DROPOUT,
         num_quantiles=Config.NUM_QUANTILES,
-        mc_samples=Config.MC_SAMPLES
+        mc_samples=Config.MC_SAMPLES,
+        num_target_vitals=Config.NUM_TARGET_VITALS,
+        trajectory_horizon_steps=Config.TRAJECTORY_HORIZON_STEPS,
     )
-    
+
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-    
+    print(f"Parameters: {total_params:,}")
+
     trainer = Trainer(model, train_loader, val_loader, Config)
-    trainer.train()
-    
+    val_scores = trainer.train()
+
+    from monitoring import DriftDetector
+    detector = DriftDetector()
+    detector.setReference(val_scores)
+    joblib.dump(detector, f"{Config.SAVE_PATH}drift_detector.pkl")
+    print("Drift detector saved.")
+
     return model, test_loader, preprocessor
+
 
 if __name__ == "__main__":
     model, test_loader, preprocessor = main()
