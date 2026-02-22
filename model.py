@@ -58,7 +58,7 @@ class TemporalFusionTransformer(nn.Module):
         self.static_context_grn = GatedResidualNetwork(hidden_size, hidden_size, hidden_size, dropout)
         self.static_enrichment_grn = GatedResidualNetwork(hidden_size, hidden_size, hidden_size, dropout)
         self.ts_encoder = nn.Linear(time_series_size, hidden_size)
-        self.lstm_encoder = nn.LSTM(hidden_size, hidden_size, batch_first=True, dropout=dropout)
+        self.lstm_encoder = nn.LSTM(hidden_size, hidden_size, num_layers=2, batch_first=True, dropout=dropout)
         self.post_lstm_gate = nn.Linear(hidden_size, hidden_size)
         self.post_lstm_norm = nn.LayerNorm(hidden_size)
         self.static_enrichment = GatedResidualNetwork(hidden_size, hidden_size, hidden_size, dropout, hidden_size)

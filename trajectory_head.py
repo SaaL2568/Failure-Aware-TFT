@@ -25,8 +25,9 @@ class TrajectoryHead(nn.Module):
         self.horizon_lstm = nn.LSTM(
             input_size=hidden_size,
             hidden_size=hidden_size,
-            num_layers=1,
+            num_layers=2,
             batch_first=True,
+            dropout=dropout,
         )
 
         self.output_proj = nn.Linear(
