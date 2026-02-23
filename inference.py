@@ -42,7 +42,7 @@ class InferencePipeline:
             trajectory_horizon_steps=Config.TRAJECTORY_HORIZON_STEPS,
         )
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.to(self.device)
         self.model.eval()

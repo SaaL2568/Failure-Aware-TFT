@@ -52,16 +52,16 @@ class Config:
     }
 
     # --- model architecture ---
-    HIDDEN_SIZE  = 128
+    HIDDEN_SIZE  = 64
     NUM_HEADS    = 4
-    DROPOUT      = 0.1
+    DROPOUT      = 0.3
     MC_SAMPLES   = 10
 
     # --- training ---
     BATCH_SIZE               = 32
     EPOCHS                   = 100
     LEARNING_RATE            = 1e-3
-    WEIGHT_DECAY             = 1e-5
+    WEIGHT_DECAY             = 1e-3
     EARLY_STOPPING_PATIENCE  = 10
     POS_WEIGHT               = 3.0
     UNCERTAINTY_WEIGHT       = 0.1

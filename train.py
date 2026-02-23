@@ -53,12 +53,16 @@ class MultiTaskLoss(nn.Module):
 #  Trainer
 # ======================================================================
 class Trainer:
-    def __init__(self, model, train_loader, val_loader, config):
+    def __init__(self, model, train_loader, val_loader, config, static_size, time_series_size):
         self.model        = model
         self.train_loader = train_loader
         self.val_loader   = val_loader
         self.config       = config
         self.device       = config.DEVICE
+        
+        # Store architecture dimensions for checkpoint saving
+        self.static_size = static_size
+        self.time_series_size = time_series_size
 
         self.model.to(self.device)
 
@@ -93,6 +97,8 @@ class Trainer:
             "val_f1":               val_f1,
             "best_val_loss":        self.best_val_loss,
             "patience_counter":     self.patience_counter,
+            "static_size":          self.static_size,
+            "time_series_size":     self.time_series_size,
         }, Config.LAST_CHECKPOINT)
 
     def load_checkpoint(self, path):
@@ -100,7 +106,7 @@ class Trainer:
             print("No checkpoint found — starting from scratch.")
             return 0
         print(f"Resuming from checkpoint: {path}")
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scheduler_state_dict" in ckpt:
@@ -180,19 +186,19 @@ class Trainer:
         auroc = roc_auc_score(all_labels, all_preds) if len(np.unique(all_labels)) > 1 else 0.0
         auprc = average_precision_score(all_labels, all_preds) if len(np.unique(all_labels)) > 1 else 0.0
 
-        # Tune threshold on val set to maximise F1 (fixes hardcoded 0.5 problem)
+        # Tune threshold on val set to maximise F1
         best_threshold = 0.5
         best_f1        = 0.0
         if len(np.unique(all_labels)) > 1:
             precisions, recalls, thresholds = precision_recall_curve(all_labels, all_preds)
+            denom = precisions + recalls
             f1_scores = np.where(
-                (precisions + recalls) > 0,
-                2 * precisions * recalls / (precisions + recalls),
+                denom > 0,
+                2 * precisions * recalls / np.where(denom > 0, denom, 1.0),
                 0.0,
             )
             best_idx       = np.argmax(f1_scores)
             best_f1        = f1_scores[best_idx]
-            # thresholds has one fewer element than precisions/recalls
             best_threshold = float(thresholds[min(best_idx, len(thresholds) - 1)])
 
         return avg_loss, auroc, auprc, best_f1, best_threshold, all_preds
@@ -206,8 +212,7 @@ class Trainer:
 
         # Check CUDA
         if not torch.cuda.is_available() and str(self.device) != "cpu":
-            print("WARNING: CUDA not available — training on CPU. "
-                  "Install a CUDA-enabled PyTorch build for GPU training.")
+            print("WARNING: CUDA not available — training on CPU.")
 
         start_epoch = 0
         if resume and Config.RESUME_TRAINING:
@@ -235,14 +240,16 @@ class Trainer:
                 self.best_val_loss    = val_loss
                 self.patience_counter = 0
                 torch.save({
-                    "epoch":                epoch,
-                    "model_state_dict":     self.model.state_dict(),
+                    "epoch": epoch,
+                    "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
-                    "val_loss":             val_loss,
-                    "val_auroc":            auroc,
-                    "val_auprc":            auprc,
-                    "val_f1":               f1,
-                    "best_threshold":       best_threshold,
+                    "val_loss": val_loss,
+                    "val_auroc": auroc,
+                    "val_auprc": auprc,
+                    "val_f1": f1,
+                    "best_threshold": best_threshold,
+                    "static_size": self.static_size,
+                    "time_series_size": self.time_series_size,
                 }, f"{self.config.SAVE_PATH}best_model.pt")
                 print("  ✓ Best model checkpoint saved.")
             else:
@@ -353,7 +360,7 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {total_params:,}\n")
 
-    trainer    = Trainer(model, train_loader, val_loader, Config)
+    trainer    = Trainer(model, train_loader, val_loader, Config, static_size, time_series_size)
     val_scores = trainer.train(resume=True)
 
     from monitoring import DriftDetector

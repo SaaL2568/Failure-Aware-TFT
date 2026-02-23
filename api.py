@@ -1,3 +1,4 @@
+import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
@@ -18,7 +19,6 @@ drift_detector: Optional[DriftDetector] = None
 
 CHECKPOINT_PATH = os.path.join(Config.SAVE_PATH, "best_model.pt")
 SCALER_PATH     = os.path.join(Config.SAVE_PATH, "scaler.pkl")
-STATIC_SIZE     = len(Config.STATIC_FEATURES)
 
 class VitalReading(BaseModel):
     heart_rate:  Optional[float] = None
@@ -70,31 +70,33 @@ async def loadModel():
     global pipeline, drift_detector
 
     if not os.path.exists(CHECKPOINT_PATH):
-        print(f"WARNING: No checkpoint found at {CHECKPOINT_PATH}. Predictions will fail until model is trained.")
+        print(f"WARNING: No checkpoint found at {CHECKPOINT_PATH}")
         return
 
-    ts_feature_cols = (
-        len([
-            f"{v}_{s}"
-            for v in ["heart_rate", "sbp", "dbp", "resp_rate", "spo2", "temperature", "map"]
-            for s in ["mean", "min", "max", "std", "slope", "last", "delta", "missing", "count", "above_high", "below_low"]
-        ])
-        + len([
-            f"{l}_{s}"
-            for l in ["creatinine", "lactate", "potassium", "sodium"]
-            for s in ["mean", "min", "max", "std", "slope", "last", "delta", "missing", "count", "above_high", "below_low"]
-        ])
-        + 1  # time_since_admission_hours
-    )
+    # Load checkpoint to get architecture dimensions
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location="cpu", weights_only=False)
+    
+    # Get sizes from checkpoint (if available)
+    if "static_size" in checkpoint and "time_series_size" in checkpoint:
+        static_size = checkpoint["static_size"]
+        time_series_size = checkpoint["time_series_size"]
+        print(f"✓ Loaded sizes from checkpoint: static={static_size}, ts={time_series_size}")
+    else:
+        # Fallback for old checkpoints without metadata
+        static_size = len(Config.STATIC_FEATURES)
+        time_series_size = 18  # Match training default
+        print(f"⚠ Using fallback sizes: static={static_size}, ts={time_series_size}")
 
+    # Create inference pipeline with correct sizes
     pipeline = InferencePipeline(
         checkpoint_path=CHECKPOINT_PATH,
         scaler_path=SCALER_PATH,
-        static_size=STATIC_SIZE,
-        time_series_size=ts_feature_cols,
+        static_size=static_size,
+        time_series_size=time_series_size,
     )
+    
     drift_detector = DriftDetector(window_size=Config.DRIFT_WINDOW_SIZE)
-    print("Model loaded and API ready.")
+    print("✓ Model loaded and API ready.")
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PatientRequest):
